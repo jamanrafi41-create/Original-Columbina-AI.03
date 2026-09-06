@@ -1,0 +1,59 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and Columbina memory isolated by Firebase Auth UID",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID"
+        },
+        "preferredName": {
+          "type": "string",
+          "description": "User's chosen preferred name for Columbina to address them"
+        },
+        "googleDisplayName": {
+          "type": "string",
+          "description": "Display name from Google profile"
+        },
+        "googleEmail": {
+          "type": "string",
+          "description": "Email address from Google profile"
+        },
+        "googlePhotoUrl": {
+          "type": "string",
+          "description": "Photo URL from Google profile"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Account creation timestamp"
+        },
+        "lastLoginAt": {
+          "type": "string",
+          "description": "Last login timestamp"
+        },
+        "userPreferences": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of user preferences"
+        },
+        "importantFacts": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of important facts about the user"
+        },
+        "relationshipContext": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Relationship notes and context"
+        },
+        "conversationSummary": {
+          "type": "string",
+          "description": "Summary of long-term conversations"
+        }
+      },
+      "required": ["uid"]
+    }
+  }
+}

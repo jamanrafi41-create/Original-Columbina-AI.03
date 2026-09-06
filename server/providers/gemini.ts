@@ -104,7 +104,6 @@ export class GeminiProvider implements AIProvider {
           contents,
           config: {
             systemInstruction: request.systemInstruction,
-            temperature: request.temperature ?? 0.75,
             responseMimeType: request.jsonMode ? 'application/json' : undefined,
           },
         });
@@ -160,7 +159,6 @@ export class GeminiProvider implements AIProvider {
           contents,
           config: {
             systemInstruction: request.systemInstruction,
-            temperature: request.temperature ?? 0.75,
             responseMimeType: request.jsonMode ? 'application/json' : undefined,
           },
         });

@@ -149,9 +149,7 @@ export class GeminiProvider implements AIProvider {
       parts: [{ text: m.cleanText || m.content }],
     }));
 
-    const candidateModels = request.taskType === 'reasoning'
-      ? ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-pro-preview']
-      : ['gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
+    const candidateModels = ['gemini-3.8-flash'];
 
     let lastError: any = null;
 

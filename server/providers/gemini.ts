@@ -53,7 +53,7 @@ export class GeminiProvider implements AIProvider {
     try {
       const client = this.getClient();
       const resp = await client.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
+        model: 'gemini-3.8-flash',
         contents: [{ parts: [{ text: 'ping' }] }],
       });
       return Boolean(resp.text);

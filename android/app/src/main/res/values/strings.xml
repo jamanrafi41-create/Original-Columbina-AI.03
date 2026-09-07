@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Columbina AI</string>
+    <string name="title_activity_main">Columbina AI</string>
+    <string name="package_name">com.columbina.ai</string>
+</resources>

@@ -1,5 +1,5 @@
 {
-  "name": "VRM 3D AI Assistant",
+  "name": "Columbina AI",
   "description": "Interactive 3D virtual companion bringing Columbina Hyposelenia to life with persistent VRM humanoid rendering, Google Gemini Primary Brain, multi-provider orchestrator, voice synthesis, lip-sync, and expressive animations.",
   "requestFramePermissions": ["microphone", "camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

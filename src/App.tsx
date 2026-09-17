@@ -13,6 +13,10 @@ import { cameraVisionService } from './services/cameraVisionService';
 import { firebaseService, auth, UserProfileData } from './services/firebaseService';
 import { onAuthStateChanged } from 'firebase/auth';
 import { CameraVisionHUD } from './components/CameraVisionHUD';
+import { androidPwaService } from './services/androidPwaService';
+import { AndroidInstallButton } from './components/AndroidInstallButton';
+import { AndroidInstallGuideModal } from './components/AndroidInstallGuideModal';
+import { voiceCorrectionService } from './services/voiceCorrectionService';
 import EtherealCavernBg from './assets/images/ethereal_cavern_moon_1788699104693.jpg';
 
 import {
@@ -147,9 +151,36 @@ export default function App() {
   const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
   const [awaitingGoogleConsent, setAwaitingGoogleConsent] = useState<boolean>(false);
   const [awaitingPreferredName, setAwaitingPreferredName] = useState<boolean>(false);
+  const [isAndroidGuideOpen, setIsAndroidGuideOpen] = useState<boolean>(false);
 
   // Timer to revert temporary emotions and animations back to neutral/idle
   const emotionResetTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // High-performance streaming speech queue & interruption controller
+  const speechQueueRef = useRef<Array<{
+    text: string;
+    emotion?: Emotion;
+    expression?: string;
+    voiceDirection?: string;
+    language?: ColumbinaLanguage;
+  }>>([]);
+  const isAudioPlayingRef = useRef<boolean>(false);
+  const streamCompleteRef = useRef<boolean>(true);
+  const chatAbortControllerRef = useRef<AbortController | null>(null);
+
+  // Stop current speech playback and streaming (for user interruption)
+  const handleStopSpeaking = useCallback(() => {
+    if (chatAbortControllerRef.current) {
+      chatAbortControllerRef.current.abort();
+      chatAbortControllerRef.current = null;
+    }
+    speechQueueRef.current = [];
+    isAudioPlayingRef.current = false;
+    streamCompleteRef.current = true;
+    audioService.stop();
+    setIsSpeaking(false);
+    setIsGenerating(false);
+  }, []);
 
   // Load available TTS voices on mount
   useEffect(() => {
@@ -244,22 +275,29 @@ export default function App() {
     }
   }, [config.soundEffects]);
 
-  // Handle Speech synthesis and Viseme driving
-  const speakText = useCallback(
+  // Play a single sentence through the configured TTS engine with fallback and viseme driving
+  const playSentenceItem = useCallback(
     async (
-      text: string,
-      emotionForSpeech?: Emotion,
-      expression?: string,
-      voiceDirection?: string,
-      languageForSpeech?: ColumbinaLanguage
+      item: {
+        text: string;
+        emotion?: Emotion;
+        expression?: string;
+        voiceDirection?: string;
+        language?: ColumbinaLanguage;
+      },
+      onFinished: () => void
     ) => {
-      if (emotionForSpeech) {
-        setCurrentEmotion(emotionForSpeech);
+      const trimmedText = item.text.trim();
+      if (!trimmedText) {
+        onFinished();
+        return;
       }
 
-      setIsSpeaking(true);
+      if (item.emotion) {
+        setCurrentEmotion(item.emotion);
+      }
 
-      const activeLang = languageForSpeech || config.currentLanguage || 'English';
+      const activeLang = item.language || config.currentLanguage || 'English';
       const speechLangCode =
         activeLang === 'Hindi'
           ? 'hi-IN'
@@ -269,38 +307,32 @@ export default function App() {
           ? 'ja-JP'
           : config.speechLanguage || 'en-US';
 
+      let finished = false;
+      const safeFinish = () => {
+        if (!finished) {
+          finished = true;
+          onFinished();
+        }
+      };
+
       if (config.ttsEngine === 'fish') {
         try {
-          const analyserNode = await audioService.speakFishAudio(text, {
+          const analyserNode = await audioService.speakFishAudio(trimmedText, {
             referenceId: config.fishReferenceId || 'f2aed07c91614db28daaaa849150cc6e',
-            expression,
-            voiceDirection,
-            onStart: () => {
-              setIsSpeaking(true);
-            },
-            onEnd: () => {
-              setIsSpeaking(false);
-              setTimeout(() => {
-                setCurrentEmotion('gentle');
-                setCurrentAnimation('idle');
-              }, 1200);
-            },
+            expression: item.expression,
+            voiceDirection: item.voiceDirection,
+            onStart: () => setIsSpeaking(true),
+            onEnd: safeFinish,
             onError: () => {
-              // Graceful fallback to browser speech synthesis
-              audioService.speak(text, {
+              // Fast graceful fallback to browser speech synthesis
+              audioService.speak(trimmedText, {
                 voiceURI: config.selectedVoiceURI,
                 rate: config.voiceSpeed,
                 pitch: config.voicePitch,
                 lang: speechLangCode,
                 onStart: () => setIsSpeaking(true),
-                onEnd: () => {
-                  setIsSpeaking(false);
-                  setTimeout(() => {
-                    setCurrentEmotion('gentle');
-                    setCurrentAnimation('idle');
-                  }, 1200);
-                },
-                onError: () => setIsSpeaking(false),
+                onEnd: safeFinish,
+                onError: safeFinish,
               });
             },
           });
@@ -310,37 +342,23 @@ export default function App() {
             return;
           }
         } catch {
-          // Handled by onError fallback
+          // Handled by safeFinish fallback
         }
       } else if (config.ttsEngine === 'gemini') {
         try {
-          const analyserNode = await audioService.speakGeminiTTS(text, {
+          const analyserNode = await audioService.speakGeminiTTS(trimmedText, {
             voice: 'Aoede',
-            onStart: () => {
-              setIsSpeaking(true);
-            },
-            onEnd: () => {
-              setIsSpeaking(false);
-              setTimeout(() => {
-                setCurrentEmotion('gentle');
-                setCurrentAnimation('idle');
-              }, 1200);
-            },
+            onStart: () => setIsSpeaking(true),
+            onEnd: safeFinish,
             onError: () => {
-              audioService.speak(text, {
+              audioService.speak(trimmedText, {
                 voiceURI: config.selectedVoiceURI,
                 rate: config.voiceSpeed,
                 pitch: config.voicePitch,
                 lang: speechLangCode,
                 onStart: () => setIsSpeaking(true),
-                onEnd: () => {
-                  setIsSpeaking(false);
-                  setTimeout(() => {
-                    setCurrentEmotion('gentle');
-                    setCurrentAnimation('idle');
-                  }, 1200);
-                },
-                onError: () => setIsSpeaking(false),
+                onEnd: safeFinish,
+                onError: safeFinish,
               });
             },
           });
@@ -350,29 +368,19 @@ export default function App() {
             return;
           }
         } catch {
-          // Handled by onError fallback
+          // Handled by safeFinish
         }
       }
 
       // Default Web Speech synthesis
-      audioService.speak(text, {
+      audioService.speak(trimmedText, {
         voiceURI: config.selectedVoiceURI,
         rate: config.voiceSpeed,
         pitch: config.voicePitch,
         lang: speechLangCode,
-        onStart: () => {
-          setIsSpeaking(true);
-        },
-        onEnd: () => {
-          setIsSpeaking(false);
-          setTimeout(() => {
-            setCurrentEmotion('gentle');
-            setCurrentAnimation('idle');
-          }, 1200);
-        },
-        onError: () => {
-          setIsSpeaking(false);
-        },
+        onStart: () => setIsSpeaking(true),
+        onEnd: safeFinish,
+        onError: safeFinish,
       });
     },
     [
@@ -384,6 +392,77 @@ export default function App() {
       config.voicePitch,
       config.voiceSpeed,
     ]
+  );
+
+  // Process the next sentence in the speech queue
+  const processNextInQueue = useCallback(() => {
+    if (speechQueueRef.current.length > 0) {
+      isAudioPlayingRef.current = true;
+      setIsSpeaking(true);
+      const next = speechQueueRef.current.shift()!;
+      playSentenceItem(next, () => {
+        processNextInQueue();
+      });
+    } else {
+      isAudioPlayingRef.current = false;
+      if (streamCompleteRef.current) {
+        setIsSpeaking(false);
+        setTimeout(() => {
+          setCurrentEmotion('gentle');
+          setCurrentAnimation('idle');
+        }, 1200);
+      }
+    }
+  }, [playSentenceItem]);
+
+  // Enqueue a sentence to be spoken as soon as it arrives
+  const enqueueSentence = useCallback(
+    (item: {
+      text: string;
+      emotion?: Emotion;
+      expression?: string;
+      voiceDirection?: string;
+      language?: ColumbinaLanguage;
+    }) => {
+      // Strip brackets, actions, parentheticals before speech
+      const clean = item.text
+        .replace(/\[.*?\]/g, '')
+        .replace(/\(.*?\)/g, '')
+        .replace(/\*[^*]+\*/g, '')
+        .trim();
+
+      if (!clean || clean.replace(/[^\p{L}\p{N}]/gu, '').length === 0) {
+        return;
+      }
+
+      speechQueueRef.current.push({ ...item, text: clean });
+      if (!isAudioPlayingRef.current) {
+        processNextInQueue();
+      }
+    },
+    [processNextInQueue]
+  );
+
+  // Handle Speech synthesis and Viseme driving for complete statements
+  const speakText = useCallback(
+    (
+      text: string,
+      emotionForSpeech?: Emotion,
+      expression?: string,
+      voiceDirection?: string,
+      languageForSpeech?: ColumbinaLanguage
+    ) => {
+      handleStopSpeaking();
+      streamCompleteRef.current = true;
+      enqueueSentence({
+        text,
+        emotion: emotionForSpeech,
+        expression,
+        voiceDirection,
+        language: languageForSpeech,
+      });
+    },
+    [handleStopSpeaking, enqueueSentence]
   );
 
   // Trigger Google Sign-In Flow
@@ -474,9 +553,14 @@ export default function App() {
   }, [speakText]);
 
   // Send message to AI Brain (Gemini / OpenAI)
-  const handleSendMessage = async (text: string, voiceAnalysis?: ParalinguisticAnalysis) => {
+  const handleSendMessage = async (
+    text: string,
+    voiceAnalysis?: ParalinguisticAnalysis,
+    image?: string,
+    imageName?: string
+  ) => {
     const trimmed = text.trim();
-    if (!trimmed || isGenerating) return;
+    if ((!trimmed && !image) || isGenerating) return;
 
     // Speech Interruption: If Columbina is currently speaking, stop playback immediately
     if (isSpeaking) {
@@ -487,7 +571,143 @@ export default function App() {
       audioService.playChime('send');
     }
 
-    const lowerText = trimmed.toLowerCase();
+    const effectiveText =
+      trimmed ||
+      (image
+        ? "Here is a photo I am sharing with you. What do you see and what are your thoughts on it?"
+        : '');
+
+    const lowerText = effectiveText.toLowerCase();
+
+    // 0. Check for Android Installation Intent ("Install this in my phone", "Install Columbina in my phone", etc.)
+    if (androidPwaService.isInstallCommand(effectiveText)) {
+      const usrMsg: ChatMessage = {
+        id: 'usr-' + Date.now(),
+        role: 'user',
+        content: effectiveText,
+        cleanText: effectiveText,
+        timestamp: Date.now(),
+        image,
+        imageName,
+      };
+      setMessages((prev) => [...prev, usrMsg]);
+
+      // Standalone check: Already installed and running
+      if (androidPwaService.isStandalone()) {
+        const standaloneReply =
+          "Columbina is already installed and running as a standalone fullscreen app on your Android home screen, connected live to this website.";
+        const astMsg: ChatMessage = {
+          id: 'ast-' + Date.now(),
+          role: 'assistant',
+          content: standaloneReply,
+          cleanText: standaloneReply,
+          emotion: 'happy',
+          animation: 'talking',
+          timestamp: Date.now(),
+        };
+        setMessages((prev) => [...prev, astMsg]);
+        speakText(standaloneReply, 'happy');
+        return;
+      }
+
+      // Android Only check
+      if (!androidPwaService.isAndroid()) {
+        const desktopReply =
+          "To install this website as an app on your phone's home screen, open this live website on your Android phone's Chrome browser and tap 'Install Columbina'. On desktop, we can continue speaking right here in your browser.";
+        const astMsg: ChatMessage = {
+          id: 'ast-' + Date.now(),
+          role: 'assistant',
+          content: desktopReply,
+          cleanText: desktopReply,
+          emotion: 'gentle',
+          animation: 'talking',
+          timestamp: Date.now(),
+        };
+        setMessages((prev) => [...prev, astMsg]);
+        speakText(desktopReply, 'gentle');
+        return;
+      }
+
+      // Android with installation prompt available: Trigger native browser prompt immediately!
+      if (androidPwaService.isPromptAvailable()) {
+        const promptNotice =
+          "Opening the Android installation prompt now. Please tap Install on your screen to add Columbina to your home screen.";
+        const astMsg: ChatMessage = {
+          id: 'ast-' + Date.now(),
+          role: 'assistant',
+          content: promptNotice,
+          cleanText: promptNotice,
+          emotion: 'curious',
+          animation: 'talking',
+          timestamp: Date.now(),
+        };
+        setMessages((prev) => [...prev, astMsg]);
+        speakText(promptNotice, 'curious');
+
+        const result = await androidPwaService.triggerInstallPrompt();
+        if (result.outcome === 'accepted') {
+          const followUp =
+            "Columbina has been added to your Android home screen! When you open Columbina, it will launch in full-screen view as an app with no browser URL bar, connected live to this website.";
+          const followUpMsg: ChatMessage = {
+            id: 'ast-' + Date.now(),
+            role: 'assistant',
+            content: followUp,
+            cleanText: followUp,
+            emotion: 'happy',
+            animation: 'talking',
+            timestamp: Date.now(),
+          };
+          setMessages((prev) => [...prev, followUpMsg]);
+          speakText(followUp, 'happy');
+        } else if (result.outcome === 'dismissed') {
+          const dismissMsg =
+            "The installation prompt was dismissed. You can tap the Install Columbina button on your screen anytime to add it to your home screen.";
+          const followUpMsg: ChatMessage = {
+            id: 'ast-' + Date.now(),
+            role: 'assistant',
+            content: dismissMsg,
+            cleanText: dismissMsg,
+            emotion: 'gentle',
+            animation: 'idle',
+            timestamp: Date.now(),
+          };
+          setMessages((prev) => [...prev, followUpMsg]);
+        } else {
+          setIsAndroidGuideOpen(true);
+          const guideReply =
+            "To install Columbina as a fullscreen app on your Android home screen, tap the 'Install Columbina' button on your screen, or tap your browser's menu (⋮) and select 'Install app' or 'Add to Home screen'.";
+          const followUpMsg: ChatMessage = {
+            id: 'ast-' + Date.now(),
+            role: 'assistant',
+            content: guideReply,
+            cleanText: guideReply,
+            emotion: 'gentle',
+            animation: 'talking',
+            timestamp: Date.now(),
+          };
+          setMessages((prev) => [...prev, followUpMsg]);
+          speakText(guideReply, 'gentle');
+        }
+        return;
+      }
+
+      // Android fallback: prompt not yet fired or requires Chrome menu
+      setIsAndroidGuideOpen(true);
+      const guideReply =
+        "To install Columbina as a standalone fullscreen app on your phone, tap your browser's menu (the three dots ⋮ at the top right) and select 'Install app' or 'Add to Home screen'.";
+      const astMsg: ChatMessage = {
+        id: 'ast-' + Date.now(),
+        role: 'assistant',
+        content: guideReply,
+        cleanText: guideReply,
+        emotion: 'curious',
+        animation: 'talking',
+        timestamp: Date.now(),
+      };
+      setMessages((prev) => [...prev, astMsg]);
+      speakText(guideReply, 'curious');
+      return;
+    }
 
     // 1. Check for Logout Intent
     const isLogoutCmd =
@@ -659,34 +879,67 @@ export default function App() {
     }
 
     // Auto-detect user facts or preferences to enrich memory
-    const lower = trimmed.toLowerCase();
+    const lower = effectiveText.toLowerCase();
     if (lower.startsWith('i love ') || lower.startsWith('i like ') || lower.startsWith('my favorite ')) {
-      memoryService.addPreference(trimmed);
+      memoryService.addPreference(effectiveText);
     } else if (lower.startsWith('my name is ') || lower.startsWith('i am a ') || lower.startsWith('i live in ')) {
-      memoryService.addFact(trimmed);
+      memoryService.addFact(effectiveText);
     }
 
     const userMessage: ChatMessage = {
       id: 'usr-' + Date.now(),
       role: 'user',
-      content: trimmed,
-      cleanText: trimmed,
+      content: effectiveText,
+      cleanText: effectiveText,
       timestamp: Date.now(),
       voiceAnalysis,
+      image,
+      imageName,
     };
 
     const newHistory = [...messages, userMessage];
     setMessages(newHistory);
     setIsGenerating(true);
 
-    // Avatar reflects thoughtfully while generating
+    // Immediate visual responsiveness without blocking speech
     setCurrentEmotion('thinking');
     setCurrentAnimation('thinking');
 
+    // Create assistant message placeholder for instant typewriter streaming
+    const assistantMsgId = 'ast-' + Date.now();
+    const assistantPlaceholder: ChatMessage = {
+      id: assistantMsgId,
+      role: 'assistant',
+      content: '',
+      cleanText: '',
+      emotion: 'gentle',
+      animation: 'talking',
+      timestamp: Date.now(),
+      language: activeLang,
+    };
+    setMessages((prev) => [...prev, assistantPlaceholder]);
+
+    // Setup streaming & cancellation
+    const abortController = new AbortController();
+    chatAbortControllerRef.current = abortController;
+    speechQueueRef.current = [];
+    isAudioPlayingRef.current = false;
+    streamCompleteRef.current = false;
+
+    let accumulatedAssistantText = '';
+    let finalDiagnostic: any = null;
+    let finalEmotion: Emotion = 'gentle';
+    let finalAnimation: CharacterAnimation = 'talking';
+    let finalExpression = '';
+    let finalVoiceDirection = '';
+
     try {
-      const response = await fetch('/api/chat', {
+      const response = await fetch('/api/chat/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+        },
         body: JSON.stringify({
           messages: newHistory.map((m, idx) => {
             const isLast = idx === newHistory.length - 1;
@@ -694,7 +947,8 @@ export default function App() {
               role: m.role,
               content: m.cleanText || m.content,
               voiceAnalysis: m.voiceAnalysis,
-              image: isLast && m.role === 'user' ? base64Image : undefined,
+              image: m.image || (isLast && m.role === 'user' ? (base64Image || undefined) : undefined),
+              imageName: m.imageName,
               isCameraActive: isLast && m.role === 'user' ? cameraVisionService.isCameraActive() : undefined,
             };
           }),
@@ -703,85 +957,149 @@ export default function App() {
           personality: config.personality,
           memory: memoryService.getMemory(),
           currentLanguage: activeLang,
+          stream: true,
         }),
+        signal: abortController.signal,
       });
 
       if (!response.ok) {
         throw new Error(`API returned ${response.status}`);
       }
 
-      const data = await response.json();
-      const responseEmotion = (data.emotion as Emotion) || 'gentle';
-      const responseAnimation = (data.animation as CharacterAnimation) || 'talking';
-      const responseIntensity = typeof data.intensity === 'number' ? data.intensity : 0.35;
-      const responseExpression = data.expression || '';
-      const responseVoiceDirection = data.voice_direction || '';
-      const spokenMessage = (data.message || data.cleanText || data.text || '').trim();
+      if (response.body) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = '';
 
-      if (data.diagnostic) {
-        setLastDiagnostic(data.diagnostic);
-      }
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-      // Ensure language state syncs from backend response
-      if (data.currentLanguage && ['English', 'Hindi', 'Bengali', 'Japanese'].includes(data.currentLanguage)) {
-        const returnedLang = data.currentLanguage as ColumbinaLanguage;
-        if (returnedLang !== config.currentLanguage) {
-          const speechMap: Record<ColumbinaLanguage, string> = {
-            English: 'en-US',
-            Hindi: 'hi-IN',
-            Bengali: 'bn-IN',
-            Japanese: 'ja-JP',
-          };
-          setConfig((prev) => ({
-            ...prev,
-            currentLanguage: returnedLang,
-            speechLanguage: speechMap[returnedLang] || 'en-US',
-          }));
-          activeLang = returnedLang;
+          sseBuffer += decoder.decode(value, { stream: true });
+          const parts = sseBuffer.split('\n\n');
+          sseBuffer = parts.pop() || '';
+
+          for (const part of parts) {
+            const trimmedPart = part.trim();
+            if (!trimmedPart.startsWith('data:')) continue;
+            const dataStr = trimmedPart.slice(5).trim();
+            if (!dataStr) continue;
+
+            try {
+              const event = JSON.parse(dataStr);
+
+              if (event.type === 'meta') {
+                if (event.emotion) {
+                  finalEmotion = event.emotion as Emotion;
+                  setCurrentEmotion(finalEmotion);
+                }
+                if (event.animation) {
+                  finalAnimation = event.animation as CharacterAnimation;
+                  setCurrentAnimation(finalAnimation);
+                }
+                if (event.intensity && typeof event.intensity === 'number') {
+                  setEmotionIntensity(event.intensity);
+                }
+                if (event.facialExpression) {
+                  setCurrentFacialExpression(event.facialExpression);
+                }
+                if (event.expression) {
+                  finalExpression = event.expression;
+                }
+                if (event.voice_direction) {
+                  finalVoiceDirection = event.voice_direction;
+                }
+                if (event.action || event.gesture) {
+                  setCurrentAction(event.action || event.gesture);
+                }
+              } else if (event.type === 'chunk') {
+                accumulatedAssistantText += event.chunk;
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === assistantMsgId
+                      ? {
+                          ...m,
+                          content: accumulatedAssistantText,
+                          cleanText: accumulatedAssistantText,
+                        }
+                      : m
+                  )
+                );
+              } else if (event.type === 'sentence') {
+                // START TTS IMMEDIATELY ON FIRST SENTENCE!
+                enqueueSentence({
+                  text: event.sentence,
+                  emotion: finalEmotion,
+                  expression: finalExpression,
+                  voiceDirection: finalVoiceDirection,
+                  language: activeLang,
+                });
+              } else if (event.type === 'done') {
+                finalDiagnostic = event.diagnostic;
+                if (event.emotion) finalEmotion = event.emotion as Emotion;
+                if (event.animation) finalAnimation = event.animation as CharacterAnimation;
+                if (event.expression) finalExpression = event.expression;
+                if (event.voice_direction) finalVoiceDirection = event.voice_direction;
+                const doneText = (event.message || event.cleanText || accumulatedAssistantText).trim();
+                accumulatedAssistantText = doneText || accumulatedAssistantText;
+
+                // Ensure language state syncs from backend response
+                if (event.currentLanguage && ['English', 'Hindi', 'Bengali', 'Japanese'].includes(event.currentLanguage)) {
+                  const returnedLang = event.currentLanguage as ColumbinaLanguage;
+                  if (returnedLang !== config.currentLanguage) {
+                    const speechMap: Record<ColumbinaLanguage, string> = {
+                      English: 'en-US',
+                      Hindi: 'hi-IN',
+                      Bengali: 'bn-IN',
+                      Japanese: 'ja-JP',
+                    };
+                    setConfig((prev) => ({
+                      ...prev,
+                      currentLanguage: returnedLang,
+                      speechLanguage: speechMap[returnedLang] || 'en-US',
+                    }));
+                    activeLang = returnedLang;
+                  }
+                }
+
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === assistantMsgId
+                      ? {
+                          ...m,
+                          content: accumulatedAssistantText,
+                          cleanText: accumulatedAssistantText,
+                          emotion: finalEmotion,
+                          animation: finalAnimation,
+                          expression: finalExpression,
+                          voice_direction: finalVoiceDirection,
+                          diagnostic: finalDiagnostic,
+                          brain: event.brain || finalDiagnostic?.selectedProvider,
+                        }
+                      : m
+                  )
+                );
+
+                if (finalDiagnostic) {
+                  setLastDiagnostic(finalDiagnostic);
+                }
+
+                if (config.soundEffects) {
+                  audioService.playChime('receive');
+                }
+              }
+            } catch (parseErr) {
+              // Ignore single malformed SSE chunk
+            }
+          }
         }
       }
-
-      const assistantMessage: ChatMessage = {
-        id: 'ast-' + Date.now(),
-        role: 'assistant',
-        content: spokenMessage,
-        cleanText: spokenMessage,
-        emotion: responseEmotion,
-        expression: responseExpression,
-        voice_direction: responseVoiceDirection,
-        animation: responseAnimation,
-        intensity: responseIntensity,
-        timestamp: Date.now(),
-        language: activeLang,
-        brain: data.brain || data.diagnostic?.selectedProvider,
-        diagnostic: data.diagnostic,
-      };
-
-      setMessages((prev) => [...prev, assistantMessage]);
-
-      // 1. Emotion -> VRM Expression System
-      setCurrentEmotion(responseEmotion);
-      setEmotionIntensity(responseIntensity);
-      if (data.facialExpression) {
-        setCurrentFacialExpression(data.facialExpression);
-      }
-
-      // 2. Animation & Action -> VRM Animation System
-      setCurrentAnimation(responseAnimation);
-      if (data.action || data.gesture) {
-        setCurrentAction(data.action || data.gesture);
-      }
-
-      if (config.soundEffects) {
-        audioService.playChime('receive');
-      }
-
-      // 3. Spoken text -> Voice / TTS System (Columbina speaks her response)
-      if (spokenMessage) {
-        speakText(spokenMessage, responseEmotion, responseExpression, responseVoiceDirection, activeLang);
-      }
     } catch (err: any) {
-      console.error('Failed to send message:', err);
+      if (err.name === 'AbortError') {
+        // User interrupted or started speaking, clean exit
+        return;
+      }
+      console.error('Streaming chat failed, falling back:', err);
       const fallbackMessages: Record<ColumbinaLanguage, string> = {
         English: "The stars fell silent for a fleeting breath... I am still here beside you, listening softly.",
         Hindi: "हवा में एक शांत झोंका बह गया... I am still here beside you, listening softly.",
@@ -789,29 +1107,34 @@ export default function App() {
         Japanese: "風が静かに通り過ぎていきましたね... I am still here beside you, listening softly.",
       };
       const fallbackText = fallbackMessages[activeLang] || fallbackMessages.English;
-      const errorMessage: ChatMessage = {
-        id: 'err-' + Date.now(),
-        role: 'assistant',
-        content: fallbackText,
-        cleanText: fallbackText,
-        emotion: 'gentle',
-        expression: '[calm]',
-        voice_direction: '',
-        animation: 'idle',
-        intensity: 0.3,
-        timestamp: Date.now(),
-        language: activeLang,
-      };
-      setMessages((prev) => [...prev, errorMessage]);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantMsgId
+            ? {
+                ...m,
+                content: fallbackText,
+                cleanText: fallbackText,
+                emotion: 'gentle',
+                expression: '[calm]',
+                animation: 'idle',
+              }
+            : m
+        )
+      );
       setCurrentEmotion('gentle');
       setCurrentAnimation('idle');
       speakText(fallbackText, 'gentle', '[calm]', '(softly)', activeLang);
     } finally {
+      streamCompleteRef.current = true;
       setIsGenerating(false);
+      chatAbortControllerRef.current = null;
+      if (speechQueueRef.current.length === 0 && !isAudioPlayingRef.current) {
+        setIsSpeaking(false);
+      }
     }
   };
 
-  // Voice utterance handler through Voice Auto-Correction & Disambiguation pipeline
+  // Voice utterance handler with deduplication, phonetic fixing, and auto-submission
   const handleVoiceUtterance = async (
     rawTranscript: string,
     language?: string,
@@ -820,67 +1143,30 @@ export default function App() {
     const trimmed = rawTranscript.trim();
     if (!trimmed || isGenerating) return;
 
-    // Speech Interruption: If Columbina is speaking, interrupt immediately
-    if (isSpeaking) {
-      handleStopSpeaking();
+    // Speech Interruption: If Columbina is speaking or thinking, interrupt immediately
+    handleStopSpeaking();
+
+    // Use intelligent speech correction (deduplication, phonetic fixing, Gemini enhancement)
+    const activeLang = language || config.speechLanguage || 'en-US';
+    const correctionResult = await voiceCorrectionService.correctTranscript(
+      trimmed,
+      activeLang,
+      messages
+    );
+
+    // Reject noise or empty transcripts
+    if (correctionResult.isNoise || !correctionResult.correctedText.trim()) {
+      return;
     }
 
-    try {
-      // 1. Pass through AI Voice Auto-Correction & Context Disambiguation
-      const correctRes = await fetch('/api/voice/correct', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          rawTranscript: trimmed,
-          recentMessages: messages.map((m) => ({
-            role: m.role,
-            content: m.cleanText || m.content,
-          })),
-          language: language || config.speechLanguage || 'en-US',
-        }),
-      });
-
-      if (!correctRes.ok) {
-        throw new Error(`Voice correction HTTP ${correctRes.status}`);
-      }
-
-      const data: VoiceCorrectionResult = await correctRes.json();
-
-      // Ignore pure acoustic noise / filler without generating an AI response (Requirement 10)
-      if (data.isNoise || !data.correctedText) {
-        return;
-      }
-
-      // If confidence is low, trigger Columbina's natural clarification spoken aloud (Requirement 6 & 7)
-      if (data.needsClarification || data.confidence < 0.50) {
-        const clarifyText =
-          data.clarificationText ||
-          "Mm... I couldn't quite hear you. Could you say that again?";
-        const assistantMessage: ChatMessage = {
-          id: 'ast-' + Date.now(),
-          role: 'assistant',
-          content: clarifyText,
-          cleanText: clarifyText,
-          emotion: 'gentle',
-          expression: '[calm]',
-          voice_direction: '(whispering)',
-          animation: 'talking',
-          intensity: 0.35,
-          timestamp: Date.now(),
-        };
-        setMessages((prev) => [...prev, assistantMessage]);
-        setCurrentEmotion('gentle');
-        setCurrentAnimation('talking');
-        speakText(clarifyText, 'gentle', '[calm]', '(whispering)');
-        return;
-      }
-
-      // High/medium confidence: send cleaned & corrected user message to Columbina Brain
-      await handleSendMessage(data.correctedText, voiceAnalysis);
-    } catch (err) {
-      console.warn('Voice auto-correction fallback, sending raw transcript:', err);
-      await handleSendMessage(trimmed, voiceAnalysis);
+    // If clarification was requested by the correction engine
+    if (correctionResult.needsClarification && correctionResult.clarificationText) {
+      speakText(correctionResult.clarificationText, 'gentle', '[soft]', '(gently)', config.currentLanguage);
+      return;
     }
+
+    // Automatically send the complete recognized and corrected sentence to Columbina Brain
+    await handleSendMessage(correctionResult.correctedText, voiceAnalysis);
   };
 
   // Replay audio for a past message
@@ -888,12 +1174,6 @@ export default function App() {
     const textToSpeak = message.cleanText || message.content;
     speakText(textToSpeak, message.emotion, message.expression, message.voice_direction);
   };
-
-  // Stop current speech playback (for user interruption)
-  const handleStopSpeaking = useCallback(() => {
-    audioService.stop();
-    setIsSpeaking(false);
-  }, []);
 
   // Avatar Poke Interaction
   const handleAvatarClick = () => {
@@ -1027,6 +1307,30 @@ export default function App() {
             speechLanguage: speechMap[lang] || 'en-US',
           }));
         }}
+      />
+
+      {/* Android-Only PWA Standalone Install Button */}
+      <AndroidInstallButton
+        onInstalled={(msg) => {
+          const astMsg: ChatMessage = {
+            id: 'ast-' + Date.now(),
+            role: 'assistant',
+            content: msg,
+            cleanText: msg,
+            emotion: 'happy',
+            animation: 'talking',
+            timestamp: Date.now(),
+          };
+          setMessages((prev) => [...prev, astMsg]);
+          speakText(msg, 'happy');
+        }}
+        onShowGuide={() => setIsAndroidGuideOpen(true)}
+      />
+
+      {/* Android Installation Guide Modal */}
+      <AndroidInstallGuideModal
+        isOpen={isAndroidGuideOpen}
+        onClose={() => setIsAndroidGuideOpen(false)}
       />
     </main>
   );

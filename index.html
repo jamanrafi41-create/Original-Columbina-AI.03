@@ -2,16 +2,36 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Columbina AI</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>VRM 3D AI Assistant</title>
     <meta name="description" content="Interactive 3D virtual companion bringing Columbina Hyposelenia to life with persistent VRM humanoid rendering, Google Gemini Primary Brain, multi-provider orchestrator, voice synthesis, lip-sync, and expressive animations." />
-    <meta property="og:title" content="Columbina AI" />
+    <meta name="theme-color" content="#0a0a0c" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Columbina" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/pwa-192x192.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta property="og:title" content="VRM 3D AI Assistant" />
     <meta property="og:description" content="Interactive 3D virtual companion bringing Columbina Hyposelenia to life with persistent VRM humanoid rendering, Google Gemini Primary Brain, multi-provider orchestrator, voice synthesis, lip-sync, and expressive animations." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+    <script>
+      (function() {
+        window.__columbinaDeferredInstallPrompt = null;
+        window.addEventListener('beforeinstallprompt', function(e) {
+          e.preventDefault();
+          window.__columbinaDeferredInstallPrompt = e;
+          window.dispatchEvent(new CustomEvent('columbina:pwa-prompt-ready'));
+          console.log('[ColumbinaPWA] Captured beforeinstallprompt early in head.');
+        });
+      })();
+    </script>
   </head>
   <body class="bg-neutral-950 text-neutral-100 antialiased overflow-hidden select-none">
     <div id="root"></div>

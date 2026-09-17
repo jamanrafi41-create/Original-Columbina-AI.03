@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { AIProvider, GenerateRequest, GenerateResponse, ProviderCapabilities } from '../types';
 import { healthManager } from '../health';
 
@@ -53,7 +53,7 @@ export class GeminiProvider implements AIProvider {
     try {
       const client = this.getClient();
       const resp = await client.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-3.1-flash-lite',
         contents: [{ parts: [{ text: 'ping' }] }],
       });
       return Boolean(resp.text);
@@ -94,7 +94,10 @@ export class GeminiProvider implements AIProvider {
     });
 
     // Prefer ultra-fast, resilient modern Gemini models (lite first for high availability)
-    const candidateModels = ['gemini-3.8-flash'];
+    const candidateModels = request.taskType === 'reasoning' || request.taskType === 'coding'
+      ? ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-pro-preview']
+      : ['gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
+
     let lastError: any = null;
 
     for (const model of candidateModels) {
@@ -104,6 +107,7 @@ export class GeminiProvider implements AIProvider {
           contents,
           config: {
             systemInstruction: request.systemInstruction,
+            temperature: request.temperature ?? 0.75,
             responseMimeType: request.jsonMode ? 'application/json' : undefined,
           },
         });
@@ -143,12 +147,35 @@ export class GeminiProvider implements AIProvider {
     const startTime = Date.now();
     const client = this.getClient();
 
-    const contents = request.messages.slice(-12).map((m) => ({
-      role: m.role === 'assistant' || m.role === 'model' ? 'model' : 'user',
-      parts: [{ text: m.cleanText || m.content }],
-    }));
+    const contents = request.messages.slice(-12).map((m) => {
+      const parts: any[] = [];
+      if (m.image) {
+        let mimeType = 'image/jpeg';
+        let base64Data = m.image;
+        if (m.image.startsWith('data:')) {
+          const split = m.image.split(';base64,');
+          mimeType = split[0].replace('data:', '');
+          base64Data = split[1];
+        }
+        parts.push({
+          inlineData: {
+            mimeType,
+            data: base64Data,
+          },
+        });
+      }
+      if (m.cleanText || m.content) {
+        parts.push({ text: m.cleanText || m.content });
+      }
+      return {
+        role: m.role === 'assistant' || m.role === 'model' ? 'model' : 'user',
+        parts,
+      };
+    });
 
-    const candidateModels = ['gemini-3.8-flash'];
+    const candidateModels = request.taskType === 'reasoning'
+      ? ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-pro-preview']
+      : ['gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
 
     let lastError: any = null;
 
@@ -159,7 +186,11 @@ export class GeminiProvider implements AIProvider {
           contents,
           config: {
             systemInstruction: request.systemInstruction,
+            temperature: request.temperature ?? 0.72,
             responseMimeType: request.jsonMode ? 'application/json' : undefined,
+            thinkingConfig: {
+              thinkingLevel: ThinkingLevel.LOW,
+            },
           },
         });
 

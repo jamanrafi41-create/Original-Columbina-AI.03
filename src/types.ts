@@ -314,6 +314,8 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   cleanText?: string;
+  image?: string;
+  imageName?: string;
   emotion?: Emotion;
   intensity?: number;
   userEmotion?: string;

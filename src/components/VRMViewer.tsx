@@ -643,6 +643,13 @@ export const VRMViewer: React.FC<VRMViewerProps> = ({
       (error) => {
         console.error('Error loading VRM model:', error);
         loadingInProgressRef.current = false;
+        // If an external or custom URL failed (e.g. rate limit, 429), fall back to bundled local model
+        if (url !== '/columbinamodel.vrm' && url !== '/model.vrm') {
+          console.warn('Attempting fallback to default local VRM model (/columbinamodel.vrm)');
+          setTimeout(() => {
+            loadVRM('/columbinamodel.vrm');
+          }, 100);
+        }
       }
     );
   }, []);

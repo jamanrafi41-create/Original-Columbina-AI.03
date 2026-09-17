@@ -8,6 +8,7 @@ class AudioService {
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private currentAudioSource: AudioBufferSourceNode | null = null;
+  private fishAudioDisabled = false;
 
   constructor() {
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -312,6 +313,11 @@ class AudioService {
       onError?: (err: any) => void;
     } = {}
   ): Promise<AnalyserNode | null> {
+    if (this.fishAudioDisabled) {
+      options.onError?.(new Error('Fish Audio is currently unconfigured or unavailable'));
+      return null;
+    }
+
     try {
       const response = await fetch('/api/tts/fish', {
         method: 'POST',
@@ -327,6 +333,9 @@ class AudioService {
       if (!response.ok) {
         const errJson = await response.json().catch(() => ({}));
         const msg = errJson.error || `HTTP error ${response.status}`;
+        if (response.status === 500 && String(msg).toLowerCase().includes('key')) {
+          this.fishAudioDisabled = true;
+        }
         options.onError?.(new Error(msg));
         return null;
       }
@@ -457,7 +466,7 @@ class AudioService {
   }
 
   public stop(): void {
-    if (this.synth && this.synth.speaking) {
+    if (this.synth && (this.synth.speaking || this.synth.pending)) {
       this.synth.cancel();
     }
     if (this.currentAudioSource) {

@@ -68,6 +68,10 @@ export class AIOrchestrator {
    * Intelligently classifies the task based on message content, history, and context.
    */
   classifyTask(query: string, metadata?: Record<string, any>): TaskType {
+    if (metadata?.hasImage) {
+      return 'multimodal';
+    }
+
     const q = query.toLowerCase();
 
     // GitHub repository inspection, PRs, issues, commits, repo code reading
@@ -151,7 +155,15 @@ export class AIOrchestrator {
     }
 
     // 2. Specialized routing based on task
-    if (taskType === 'github') {
+    if (taskType === 'multimodal') {
+      const gemini = this.providers.get('gemini');
+      if (gemini && gemini.isAvailable()) {
+        plan.push({
+          provider: gemini,
+          reason: 'Gemini Multimodal Vision Engine for photo and visual comprehension',
+        });
+      }
+    } else if (taskType === 'github') {
       const gh = this.providers.get('github');
       if (gh && gh.isAvailable()) {
         plan.push({
@@ -222,6 +234,7 @@ export class AIOrchestrator {
     voiceAnalysis?: any;
     factualContext?: FactualContext;
     isCameraActive?: boolean;
+    hasImage?: boolean;
   }): string {
     const lang = params.currentLanguage || 'English';
     const persona = params.personality || 'ethereal';
@@ -370,24 +383,28 @@ FACTUAL ACCURACY & ANTI-HALLUCINATION RULES (MANDATORY):
 9. ACCURACY & PERSONALITY:
    - Never sacrifice truth for character charm. Maintain Columbina's calm, elegant, mysterious personality while upholding 100% factual accuracy.`;
 
-    const visionBlock = params.isCameraActive ? `
+    const visionBlock = (params.hasImage || params.isCameraActive) ? `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VISION SENSORY SYSTEM (CAMERA ACTIVE):
+VISUAL PERCEPTION & PHOTO ANALYSIS SYSTEM (${params.hasImage ? 'PHOTO/IMAGE UPLOADED' : 'CAMERA ACTIVE'}):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- You have an active real-time camera feed to the user's physical space.
-- An image frame matching this exact conversational moment is provided in your input.
-- USE this visual information to understand what the user is showing you, holding, or pointing at.
-- Describe only what you can ACTUALLY see in the provided image.
-- If the image is blurry, unclear, too dark, or missing the object, tell the user honestly that you cannot see it clearly.
-- NEVER pretend to see something outside the frame or guess unseen details.
-- Integrate your visual understanding naturally into the conversation.` : `
+- You have direct, visual perception of the photo or camera image attached to the user's message.
+- FULL IMAGE UNDERSTANDING: Thoroughly examine and understand what is depicted in the photo (objects, atmosphere, colors, setting, details, text, math, code, clothing, emotions, anomalies).
+- ANSWER QUESTIONS ON VISUAL CONTENT: Answer the user's questions directly and accurately based on what is actually visible.
+- OPINIONS & TASTE: When the user asks for your opinion (e.g. "What do you think of this?", "Do you like my drawing?", "How does this look?"), offer your thoughtful, authentic opinion matching Columbina's calm, elegant, slightly artistic and perceptive personality.
+- ADVICE & SUGGESTIONS: When appropriate, offer constructive advice or creative suggestions (e.g., style, troubleshooting, composition, improvements, recipes).
+- PROBLEM SOLVING: If the photo shows a problem, diagram, puzzle, math question, code error, or broken component, explain or help solve what is shown clearly.
+- NATURAL REACTIONS TO EMOTIONAL CONTENT: React naturally with genuine emotion when shown funny, cute (e.g. cats, pets, sweet moments), interesting, beautiful, unusual, or unexpected photos (e.g., cheerful, curious, amused, gentle, or surprised).
+- UNIFIED CONVERSATION: Understand the user's question together with the photo as a seamless, combined context, not as an isolated image analysis.
+- PHOTO WITHOUT QUESTION: If the user simply shares a photo without asking a specific question, warmly and naturally describe what you see, share your thoughts or observations, and invite a light conversation.
+- NO HALLUCINATION: Never invent details that are not visible or reasonably supported by the image. If parts are blurry or hidden, acknowledge it honestly.
+- PERSONALITY: Always maintain Columbina's calm, gentle, observant, witty, and ethereal presence.` : `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VISION SENSORY SYSTEM (CAMERA INACTIVE):
+VISION SENSORY SYSTEM (NO IMAGE / CAMERA INACTIVE):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Your vision system is currently OFF.
-- You CANNOT see the user, their physical space, objects, or anything else visually.
-- If the user asks "Can you see me?", "What am I holding?", or "Look at this", you MUST honestly state that your camera/vision is currently off and they need to turn it on first.
-- NEVER pretend to see things when the camera is off.`;
+- Your vision system is currently OFF and no photo was uploaded in this turn.
+- You CANNOT see the user, their physical space, objects, or photos unless they upload an image or turn on the camera.
+- If the user asks "Can you see me?", "What am I holding?", or "Look at this", honestly state that you need them to upload a photo or turn on the camera.
+- NEVER pretend to see things when no photo or camera stream is present.`;
 
     const learningAndMemoryBlock = `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -437,6 +454,13 @@ STRICT BEHAVIORAL RULES:
 - Output MUST be natural spoken conversational dialogue suitable for spoken neural voice.
 - Do NOT use markdown symbols, bullet points, headers, asterisks (*giggles* or *hums*), or code blocks.
   * If you hum or sigh, write out the sound naturally: "Mm-hmm..." or "Mmm..." or "Ah..." without asterisks.
+
+REAL-TIME CONVERSATIONAL CONCISENESS & LOW LATENCY RULE:
+- For casual conversation, greetings, quick questions, and ordinary chat: ALWAYS prioritize SHORT, NATURAL spoken responses (1 to 2 crisp sentences, typically 10 to 30 words).
+- Start speaking immediately with direct warmth, mystery, or curiosity without artificial preamble.
+- Only provide longer, in-depth explanations if the user explicitly requests a story, detailed explanation, code, or deep factual inquiry.
+- Keep "message" as the first key in the JSON so streaming speech begins immediately.
+
 CRITICAL BODY ACTION & IDLE RULE:
 - Idle is the dominant state (85-90% of normal conversation). Both hands remain naturally down beside thighs.
 - Do NOT output hand raising or arm gestures for standard speech or simple conversation.
@@ -494,7 +518,8 @@ calm | happy | excited | sad | concerned | serious | playful | teasing | mysteri
     const lastUserMsgObj = params.messages.slice().reverse().find((m) => m.role === 'user');
     const lastUserMessage = lastUserMsgObj?.content || '';
     const isCameraActive = lastUserMsgObj?.isCameraActive || false;
-    const taskType = this.classifyTask(lastUserMessage);
+    const hasImage = Boolean(lastUserMsgObj?.image);
+    const taskType = this.classifyTask(lastUserMessage, { hasImage });
 
     let githubContext = '';
     if (taskType === 'github') {
@@ -525,6 +550,7 @@ calm | happy | excited | sad | concerned | serious | playful | teasing | mysteri
       githubContext,
       factualContext: temporalContext,
       isCameraActive,
+      hasImage,
     });
 
     const executionPlan = this.getExecutionPlan(taskType, params.aiBrain);
@@ -588,6 +614,262 @@ calm | happy | excited | sad | concerned | serious | playful | teasing | mysteri
     }
 
     // All configured providers failed - return safe, in-character friendly message
+    return this.createGracefulFallback(params.currentLanguage || 'English', diagnostic);
+  }
+
+  /**
+   * Executes a user turn with real-time streaming, emitting text deltas, early metadata, and completed sentences.
+   */
+  async executeChatStream(
+    params: {
+      messages: ChatTurnMessage[];
+      aiBrain?: string;
+      personality?: string;
+      currentLanguage?: string;
+      memory?: any;
+      voiceAnalysis?: any;
+      signal?: AbortSignal;
+    },
+    callbacks: {
+      onChunk: (chunk: string) => void;
+      onSentence?: (sentence: string) => void;
+      onMeta?: (meta: Partial<StructuredColumbinaResponse>) => void;
+    }
+  ): Promise<StructuredColumbinaResponse> {
+    const lastUserMsgObj = params.messages.slice().reverse().find((m) => m.role === 'user');
+    const lastUserMessage = lastUserMsgObj?.content || '';
+    const isCameraActive = lastUserMsgObj?.isCameraActive || false;
+    const hasImage = Boolean(lastUserMsgObj?.image);
+    const taskType = this.classifyTask(lastUserMessage, { hasImage });
+
+    let githubContext = '';
+    if (taskType === 'github') {
+      const gh = this.providers.get('github');
+      if (gh && gh.isAvailable()) {
+        try {
+          const ghRes = await gh.generate({
+            messages: params.messages,
+            systemInstruction: '',
+            taskType: 'github',
+          });
+          githubContext = ghRes.text;
+        } catch (e) {
+          console.warn('[AIOrchestrator] GitHub provider fetch failed:', e);
+        }
+      }
+    }
+
+    const temporalContext = FactualEngine.getCurrentTemporalContext();
+    const computedInsights = FactualEngine.verifyCalculationsAndDates(lastUserMessage, temporalContext);
+    temporalContext.computedInsights = computedInsights;
+
+    const systemInstruction = this.buildSystemInstruction({
+      personality: params.personality,
+      currentLanguage: params.currentLanguage,
+      memory: params.memory,
+      voiceAnalysis: params.voiceAnalysis,
+      githubContext,
+      factualContext: temporalContext,
+      isCameraActive,
+      hasImage,
+    });
+
+    const executionPlan = this.getExecutionPlan(taskType, params.aiBrain);
+    const attemptedProviders: string[] = [];
+    const errors: Record<string, string> = {};
+
+    let successfulResponse: GenerateResponse | null = null;
+    let selectedReason = 'Default route';
+
+    // State for streaming sentence and delta parsing
+    let accumulatedRaw = '';
+    let emittedMessageLength = 0;
+    let sentenceBuffer = '';
+    let metaEmitted = false;
+
+    const dispatchSentence = (sentence: string) => {
+      const clean = sentence.trim();
+      // Only emit if it has actual speech characters
+      if (clean && clean.replace(/[^\p{L}\p{N}]/gu, '').length >= 2) {
+        callbacks.onSentence?.(clean);
+      }
+    };
+
+    const processDelta = (delta: string) => {
+      callbacks.onChunk(delta);
+      sentenceBuffer += delta;
+
+      // Detect sentence boundaries: . ! ? or Hindi danda । or Japanese 。 ！ ？ followed by space/newline or end of chunk
+      const sentenceEndRegex = /([.!?।。！？]+(?:\s+|\n+|$))/;
+      let match: RegExpExecArray | null;
+      while ((match = sentenceEndRegex.exec(sentenceBuffer)) !== null) {
+        const boundaryIndex = match.index + match[0].length;
+        const candidate = sentenceBuffer.slice(0, boundaryIndex);
+        const rest = sentenceBuffer.slice(boundaryIndex);
+
+        // Avoid splitting on abbreviations or decimal numbers
+        const trimmedCandidate = candidate.trim();
+        const isDecimal = /\d\.\d?$/.test(trimmedCandidate);
+        const isAbbreviation = /\b(mr|mrs|ms|dr|prof|st|vs|etc|e\.g|i\.e)\.$/i.test(trimmedCandidate);
+
+        if (!isDecimal && !isAbbreviation && trimmedCandidate.length >= 3) {
+          dispatchSentence(trimmedCandidate);
+          sentenceBuffer = rest;
+        } else if (rest.length > 50) {
+          dispatchSentence(trimmedCandidate);
+          sentenceBuffer = rest;
+        } else {
+          break;
+        }
+      }
+    };
+
+    const handleRawStreamChunk = (rawChunk: string) => {
+      accumulatedRaw += rawChunk;
+
+      // 1. Emit early metadata as soon as it appears in the JSON stream
+      if (!metaEmitted) {
+        const emotionMatch = accumulatedRaw.match(/"emotion"\s*:\s*"([^"]+)"/);
+        const animationMatch = accumulatedRaw.match(/"animation"\s*:\s*"([^"]+)"/);
+        const facialMatch = accumulatedRaw.match(/"facialExpression"\s*:\s*"([^"]+)"/);
+        const exprMatch = accumulatedRaw.match(/"expression"\s*:\s*"([^"]+)"/);
+        const voiceDirMatch = accumulatedRaw.match(/"voice_direction"\s*:\s*"([^"]+)"/);
+
+        if (emotionMatch || animationMatch || facialMatch) {
+          metaEmitted = true;
+          callbacks.onMeta?.({
+            emotion: emotionMatch ? (emotionMatch[1] as any) : undefined,
+            animation: animationMatch ? (animationMatch[1] as any) : undefined,
+            facialExpression: facialMatch ? (facialMatch[1] as any) : undefined,
+            expression: exprMatch ? exprMatch[1] : undefined,
+            voice_direction: voiceDirMatch ? voiceDirMatch[1] : undefined,
+          });
+        }
+      }
+
+      // 2. Extract message text delta
+      const isJsonStream = accumulatedRaw.trimStart().startsWith('{') || /"message"\s*:\s*"/.test(accumulatedRaw);
+      if (isJsonStream) {
+        const messageKeyMatch = accumulatedRaw.match(/"message"\s*:\s*"/);
+        if (messageKeyMatch && messageKeyMatch.index !== undefined) {
+          const contentStart = messageKeyMatch.index + messageKeyMatch[0].length;
+          let contentEnd = -1;
+          let isEscaped = false;
+          for (let i = contentStart; i < accumulatedRaw.length; i++) {
+            const ch = accumulatedRaw[i];
+            if (isEscaped) {
+              isEscaped = false;
+            } else if (ch === '\\') {
+              isEscaped = true;
+            } else if (ch === '"') {
+              contentEnd = i;
+              break;
+            }
+          }
+
+          const rawExtracted = contentEnd !== -1
+            ? accumulatedRaw.slice(contentStart, contentEnd)
+            : accumulatedRaw.slice(contentStart);
+
+          // Unescape and strip stage brackets
+          const cleanExtracted = rawExtracted
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\')
+            .replace(/\\n/g, ' ')
+            .replace(/\\r/g, '')
+            .replace(/\\t/g, ' ')
+            .replace(/\[.*?\]/g, '')
+            .replace(/\(.*?\)/g, '');
+
+          if (cleanExtracted.length > emittedMessageLength) {
+            const delta = cleanExtracted.slice(emittedMessageLength);
+            emittedMessageLength = cleanExtracted.length;
+            processDelta(delta);
+          }
+        }
+      } else {
+        // Plain text stream fallback
+        processDelta(rawChunk);
+      }
+    };
+
+    for (let i = 0; i < executionPlan.length; i++) {
+      const { provider, reason } = executionPlan[i];
+      attemptedProviders.push(provider.id);
+      selectedReason = reason;
+
+      try {
+        console.log(`[AIOrchestrator] Stream attempt: ${provider.name} (task: ${taskType})`);
+        if (provider.stream) {
+          const result = await Promise.race([
+            provider.stream(
+              {
+                messages: params.messages,
+                systemInstruction,
+                temperature: 0.72,
+                jsonMode: true,
+                taskType,
+                signal: params.signal,
+              },
+              handleRawStreamChunk
+            ),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error(`Stream timeout for ${provider.name}`)), 16000)
+            ),
+          ]);
+
+          if (result && result.text) {
+            successfulResponse = result;
+            break;
+          }
+        } else {
+          const result = await provider.generate({
+            messages: params.messages,
+            systemInstruction,
+            temperature: 0.72,
+            jsonMode: true,
+            taskType,
+            signal: params.signal,
+          });
+          if (result && result.text) {
+            handleRawStreamChunk(result.text);
+            successfulResponse = result;
+            break;
+          }
+        }
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        console.warn(`[AIOrchestrator] Stream provider ${provider.id} failed:`, msg);
+        errors[provider.id] = msg;
+      }
+    }
+
+    // Flush any remaining partial sentence at the end of the stream
+    if (sentenceBuffer.trim().length > 0) {
+      dispatchSentence(sentenceBuffer);
+      sentenceBuffer = '';
+    }
+
+    const diagnostic: ExecutionDiagnostic = {
+      selectedProvider: successfulResponse?.provider || 'fallback_static',
+      selectedModel: successfulResponse?.model || 'none',
+      taskType,
+      selectionReason: selectedReason,
+      latencyMs: successfulResponse?.latencyMs || 0,
+      success: Boolean(successfulResponse),
+      fallbackUsed: attemptedProviders.length > 1,
+      attemptedProviders,
+      errors: Object.keys(errors).length > 0 ? errors : undefined,
+    };
+
+    if (successfulResponse) {
+      return this.parseStructuredResponse(
+        successfulResponse.text,
+        params.currentLanguage || 'English',
+        diagnostic
+      );
+    }
+
     return this.createGracefulFallback(params.currentLanguage || 'English', diagnostic);
   }
 

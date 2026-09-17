@@ -7,10 +7,19 @@ import {
   Loader2,
   Volume2,
   AlertCircle,
+  Image as ImageIcon,
+  X,
 } from 'lucide-react';
 import { Emotion, ColumbinaLanguage, ParalinguisticAnalysis } from '../types';
 import { voiceAnalysisService } from '../services/voiceAnalysisService';
 import { audioService } from '../services/audioService';
+import {
+  mergeSpeechTranscripts,
+  cleanFinalTranscript,
+  getSilenceTimeoutForUtterance,
+  isNoiseTranscript,
+  normalizeForComparison,
+} from '../utils/speechDeduplicator';
 
 export const AVAILABLE_SPEECH_LANGUAGES = [
   { code: 'en-US', label: 'English (US)', short: 'EN' },
@@ -32,7 +41,12 @@ interface EtherealDialogueBarProps {
   currentEmotion?: Emotion;
   speechLanguage?: string;
   currentLanguage?: ColumbinaLanguage;
-  onSendMessage: (message: string, voiceAnalysis?: ParalinguisticAnalysis) => void;
+  onSendMessage: (
+    message: string,
+    voiceAnalysis?: ParalinguisticAnalysis,
+    image?: string,
+    imageName?: string
+  ) => void;
   onSendVoiceUtterance?: (
     rawText: string,
     language: string,
@@ -66,7 +80,14 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
   const [isBarHidden, setIsBarHidden] = useState(false);
   const [hasSpeechSupport, setHasSpeechSupport] = useState(true);
   const [selectedLang, setSelectedLang] = useState(speechLanguage || 'en-US');
+  const [selectedImage, setSelectedImage] = useState<{
+    base64: string;
+    name: string;
+    size: string;
+  } | null>(null);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
 
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
   const isMicActiveRef = useRef(false);
   const isSpeakingRef = useRef(false);
@@ -79,9 +100,119 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
 
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const restartTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const accumulatedTranscriptRef = useRef<string>('');
+  const turnHistoryRef = useRef<string>('');
+  const sessionFinalRef = useRef<string>('');
+  const sessionInterimRef = useRef<string>('');
+  const pendingUtteranceRef = useRef<string>('');
+  const isSubmittingRef = useRef<boolean>(false);
   const lastProcessedTextRef = useRef<string>('');
   const lastProcessedTimeRef = useRef<number>(0);
+
+  // Helper to read and compress/format image file
+  const processImageFile = useCallback((file: File) => {
+    if (!file || !file.type.startsWith('image/')) return;
+
+    // Check size limit (allow up to 20MB)
+    if (file.size > 20 * 1024 * 1024) {
+      alert('Photo is too large. Please select an image smaller than 20MB.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const result = e.target?.result as string;
+      if (!result) return;
+
+      // Check if image needs downscaling (if large)
+      const img = new Image();
+      img.onload = () => {
+        const maxDimension = 1400;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxDimension || height > maxDimension) {
+          if (width > height) {
+            height = Math.round((height * maxDimension) / width);
+            width = maxDimension;
+          } else {
+            width = Math.round((width * maxDimension) / height);
+            height = maxDimension;
+          }
+
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(img, 0, 0, width, height);
+            const optimizedBase64 = canvas.toDataURL('image/jpeg', 0.88);
+            setSelectedImage({
+              base64: optimizedBase64,
+              name: file.name,
+              size: (file.size / 1024).toFixed(0) + ' KB',
+            });
+            return;
+          }
+        }
+
+        setSelectedImage({
+          base64: result,
+          name: file.name,
+          size: (file.size / 1024).toFixed(0) + ' KB',
+        });
+      };
+      img.src = result;
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      processImageFile(file);
+    }
+    // reset input value so re-uploading the same file triggers change
+    if (e.target) {
+      e.target.value = '';
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file && file.type.startsWith('image/')) {
+      processImageFile(file);
+    }
+  };
+
+  // Support clipboard paste for images
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.startsWith('image/')) {
+        const file = items[i].getAsFile();
+        if (file) {
+          processImageFile(file);
+          break;
+        }
+      }
+    }
+  };
 
   // Keep refs updated for event callbacks
   useEffect(() => {
@@ -150,72 +281,96 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
     } catch (e) {}
   }, []);
 
-  // Commit recognized speech turn to Columbina through Auto-Correction
+  // Reset all in-flight speech buffers
+  const clearSpeechBuffers = useCallback(() => {
+    turnHistoryRef.current = '';
+    sessionFinalRef.current = '';
+    sessionInterimRef.current = '';
+    pendingUtteranceRef.current = '';
+    setInterimSpeech('');
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+  }, []);
+
+  // Commit recognized speech turn to Columbina
   const commitUserUtterance = useCallback(
     (rawText: string) => {
-      const trimmed = rawText.trim();
-      if (!trimmed || isGeneratingRef.current || isSpeakingRef.current) return;
+      if (isSubmittingRef.current) return;
 
-      // 1. Noise handling: ignore pure fillers (Requirement 10)
-      const fillerRegex = /^(uh+|um+|hm+|err+|ah+|huh+|shh+|mhm+|tsk+|oh+)$/i;
-      const words = trimmed.replace(/[^\p{L}\p{N}\s]/gu, '').trim().split(/\s+/);
-      if (words.length === 1 && fillerRegex.test(words[0])) {
-        accumulatedTranscriptRef.current = '';
-        setInterimSpeech('');
+      const fullCombined = mergeSpeechTranscripts([
+        turnHistoryRef.current,
+        rawText,
+      ]).trim();
+
+      const finalFormatted = cleanFinalTranscript(fullCombined);
+      if (!finalFormatted || isNoiseTranscript(finalFormatted)) {
+        clearSpeechBuffers();
         return;
       }
 
-      // 2. Prevent Columbina from hearing her own voice (Requirement 16)
+      if (isGeneratingRef.current || isSpeakingRef.current) {
+        return;
+      }
+
+      // Prevent Columbina from hearing her own voice echo
       if (lastSpokenTextRef.current) {
-        const normSpoken = lastSpokenTextRef.current.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-        const normIncoming = trimmed.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+        const normSpoken = normalizeForComparison(lastSpokenTextRef.current);
+        const normIncoming = normalizeForComparison(finalFormatted);
         if (
           normSpoken &&
           normIncoming &&
           normIncoming.length > 8 &&
           (normSpoken.includes(normIncoming) || normIncoming.includes(normSpoken))
         ) {
-          accumulatedTranscriptRef.current = '';
-          setInterimSpeech('');
+          clearSpeechBuffers();
           return;
         }
       }
 
-      // 3. Turn management & deduplication within 4.5s (Requirement 8)
+      // Prevent duplicate sends within 2500ms
       const now = Date.now();
-      const cleanCurrent = trimmed.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-      const cleanLast = lastProcessedTextRef.current.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
       if (
-        cleanCurrent &&
-        cleanLast &&
-        (cleanCurrent === cleanLast ||
-          (now - lastProcessedTimeRef.current < 2500 &&
-            (cleanCurrent.includes(cleanLast) || cleanLast.includes(cleanCurrent)))) &&
-        now - lastProcessedTimeRef.current < 4500
+        normalizeForComparison(finalFormatted) === normalizeForComparison(lastProcessedTextRef.current) &&
+        now - lastProcessedTimeRef.current < 2500
       ) {
-        accumulatedTranscriptRef.current = '';
-        setInterimSpeech('');
+        clearSpeechBuffers();
         return;
       }
 
-      lastProcessedTextRef.current = trimmed;
+      // Lock submission immediately to prevent race conditions
+      isSubmittingRef.current = true;
+      lastProcessedTextRef.current = finalFormatted;
       lastProcessedTimeRef.current = now;
-      accumulatedTranscriptRef.current = '';
-      setInterimSpeech('');
-      setInputText('');
 
-      // Temporarily pause recognition while Columbina processes turn
+      // Clear buffers for next turn
+      clearSpeechBuffers();
+
+      // Temporarily pause recognition while Columbina generates response
       safeStopRecognition();
+
+      // Analyze acoustics & paralinguistics (e.g. laughter, hmm, sigh, pitch, speed)
+      let voiceAnalysis: ParalinguisticAnalysis | undefined;
+      try {
+        voiceAnalysis = voiceAnalysisService.analyzeUtterance(finalFormatted);
+      } catch (e) {
+        console.warn('Paralinguistic analysis error:', e);
+      }
 
       if (onSendVoiceUtteranceRef.current) {
         setIsValidatingVoice(true);
-        onSendVoiceUtteranceRef.current(trimmed, selectedLangRef.current)
-          .finally(() => setIsValidatingVoice(false));
+        onSendVoiceUtteranceRef.current(finalFormatted, selectedLangRef.current, voiceAnalysis)
+          .finally(() => {
+            setIsValidatingVoice(false);
+            isSubmittingRef.current = false;
+          });
       } else {
-        onSendMessageRef.current(trimmed);
+        onSendMessageRef.current(finalFormatted, voiceAnalysis);
+        isSubmittingRef.current = false;
       }
     },
-    [safeStopRecognition]
+    [clearSpeechBuffers, safeStopRecognition]
   );
 
   // Setup Web Speech Recognition
@@ -240,51 +395,56 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
     };
 
     recognition.onresult = (event: any) => {
-      // Speech Interruption: If user starts speaking while Columbina is talking, stop TTS immediately
-      if (isSpeakingRef.current) {
+      // Speech Interruption: If user starts speaking while Columbina is talking or thinking, interrupt immediately
+      if (isSpeakingRef.current || isGeneratingRef.current) {
         onStopSpeakingRef.current?.();
       }
 
-      let currentFinal = '';
-      let currentInterim = '';
+      // Extract all session finals and interims from current recognition session
+      const finalParts: string[] = [];
+      const interimParts: string[] = [];
 
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
+      for (let i = 0; i < event.results.length; ++i) {
         const item = event.results[i];
-        const text = item[0]?.transcript || '';
+        const text = (item[0]?.transcript || '').trim();
+        if (!text) continue;
         if (item.isFinal) {
-          currentFinal += text + ' ';
+          finalParts.push(text);
         } else {
-          currentInterim += text;
+          interimParts.push(text);
         }
       }
 
-      if (currentFinal.trim()) {
-        accumulatedTranscriptRef.current = (
-          accumulatedTranscriptRef.current + ' ' + currentFinal
-        ).trim();
-      }
+      sessionFinalRef.current = finalParts.join(' ').trim();
+      sessionInterimRef.current = interimParts.join(' ').trim();
 
-      const activeTotal = (
-        accumulatedTranscriptRef.current + ' ' + currentInterim
-      ).trim();
+      // Safely merge accumulated history + session finals + session interims
+      const combinedSpeech = mergeSpeechTranscripts([
+        turnHistoryRef.current,
+        sessionFinalRef.current,
+        sessionInterimRef.current,
+      ]).trim();
 
-      if (activeTotal) {
-        // Real-time preview without sending interim results to AI (Requirement 9)
-        setInterimSpeech(activeTotal);
+      if (combinedSpeech) {
+        pendingUtteranceRef.current = combinedSpeech;
+        setInterimSpeech(combinedSpeech);
 
-        // Turn Management: Natural silence detection debounce
+        // Turn Management: Reset silence detection timer
         if (silenceTimerRef.current) {
           clearTimeout(silenceTimerRef.current);
         }
 
+        // Natural pause tolerance: dynamic delay (2200ms - 3000ms) prevents premature cutoffs
+        const timeoutMs = getSilenceTimeoutForUtterance(combinedSpeech);
         silenceTimerRef.current = setTimeout(() => {
-          commitUserUtterance(activeTotal);
-        }, 1000);
+          if (pendingUtteranceRef.current && !isSubmittingRef.current) {
+            commitUserUtterance(pendingUtteranceRef.current);
+          }
+        }, timeoutMs);
       }
     };
 
     recognition.onerror = (event: any) => {
-      console.warn('SpeechRecognition error:', event.error);
       if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
         setMicPermissionError(
           'Microphone permission was denied. Please allow microphone access in your browser settings to talk with Columbina.'
@@ -296,6 +456,16 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
     };
 
     recognition.onend = () => {
+      // When browser ends session (pause or buffer cycling), move session finals into turnHistory
+      if (sessionFinalRef.current) {
+        turnHistoryRef.current = mergeSpeechTranscripts([
+          turnHistoryRef.current,
+          sessionFinalRef.current,
+        ]);
+        sessionFinalRef.current = '';
+        sessionInterimRef.current = '';
+      }
+
       // Auto-restart if continuous microphone is still active and Columbina is not speaking/thinking
       if (isMicActiveRef.current && !isGeneratingRef.current && !isSpeakingRef.current) {
         if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
@@ -303,7 +473,7 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
           if (isMicActiveRef.current && !isGeneratingRef.current && !isSpeakingRef.current) {
             safeStartRecognition();
           }
-        }, 150);
+        }, 50);
       }
     };
 
@@ -316,16 +486,16 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
         recognition.abort();
       } catch (e) {}
     };
-  }, [commitUserUtterance, safeStartRecognition]);
+  }, [clearSpeechBuffers, commitUserUtterance, safeStartRecognition]);
 
-  // Auto-resume continuous listening when Columbina finishes speaking (Requirement 15 & 16)
+  // Auto-resume continuous listening when Columbina finishes speaking
   useEffect(() => {
     if (isMicActive && !isSpeaking && !isGenerating) {
       const timer = setTimeout(() => {
         if (isMicActiveRef.current && !isSpeakingRef.current && !isGeneratingRef.current) {
           safeStartRecognition();
         }
-      }, 300);
+      }, 250);
       return () => clearTimeout(timer);
     }
   }, [isMicActive, isSpeaking, isGenerating, safeStartRecognition]);
@@ -350,11 +520,13 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
       safeStopRecognition();
       setInterimSpeech('');
+      pendingUtteranceRef.current = '';
     } else {
       // User clicked microphone: turn ON continuously
       setMicPermissionError(null);
       setIsMicActive(true);
       isMicActiveRef.current = true;
+      pendingUtteranceRef.current = '';
       if (isSpeaking) {
         onStopSpeakingRef.current?.();
       }
@@ -362,32 +534,52 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
     }
   };
 
-  // Text message submit
+  // Text message submit (for manual typing or photo sending)
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    const trimmed = (interimSpeech || inputText).trim();
-    if (!trimmed || isGenerating) return;
+    const trimmed = inputText.trim();
+    if ((!trimmed && !selectedImage) || isGenerating) return;
 
     if (isSpeaking) {
       onStopSpeakingRef.current?.();
     }
 
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    accumulatedTranscriptRef.current = '';
+    pendingUtteranceRef.current = '';
     setInterimSpeech('');
 
     safeStopRecognition();
 
-    onSendMessage(trimmed);
+    onSendMessage(
+      trimmed,
+      undefined,
+      selectedImage?.base64,
+      selectedImage?.name
+    );
     setInputText('');
+    setSelectedImage(null);
   };
 
   return (
     <div
       onClick={(e) => e.stopPropagation()}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
       className="fixed inset-x-0 bottom-6 z-30 flex flex-col items-center pointer-events-none px-4"
     >
+      {/* Hidden File Input for Photo Upload */}
+      <input
+        type="file"
+        ref={fileInputRef}
+        accept="image/*"
+        onChange={handleFileInputChange}
+        className="hidden"
+        id="photo-upload-file-input"
+        aria-label="Upload photo file"
+      />
+
       {/* Floating Capsule Input Bar */}
       {!isBarHidden ? (
         <div className="w-full max-w-md pointer-events-auto">
@@ -408,16 +600,88 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
             </div>
           )}
 
+          {/* Attached Image Preview Chip */}
+          {selectedImage && (
+            <div className="mb-2 px-3 py-1.5 rounded-2xl bg-neutral-900/95 border border-purple-500/50 text-neutral-200 text-xs flex items-center justify-between gap-2.5 shadow-2xl backdrop-blur-xl animate-in fade-in slide-in-from-bottom-2 duration-200">
+              <div className="flex items-center gap-2.5 overflow-hidden">
+                <div className="relative shrink-0">
+                  <img
+                    src={selectedImage.base64}
+                    alt={selectedImage.name}
+                    className="w-9 h-9 rounded-lg object-cover border border-purple-400/40 shadow-sm"
+                  />
+                  <span className="absolute -bottom-1 -right-1 flex h-2 w-2">
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-purple-400"></span>
+                  </span>
+                </div>
+                <div className="flex flex-col truncate text-left">
+                  <span className="text-xs font-medium text-purple-200 truncate max-w-[200px] md:max-w-[240px]">
+                    {selectedImage.name}
+                  </span>
+                  <span className="text-[10px] text-neutral-400">
+                    Photo attached • Ask Columbina anything about it
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                id="remove-attached-photo-btn"
+                onClick={() => setSelectedImage(null)}
+                className="p-1.5 text-neutral-400 hover:text-rose-300 hover:bg-white/10 rounded-full transition shrink-0"
+                title="Remove attached photo"
+                aria-label="Remove attached photo"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {/* Real-time Voice Live Speech Indicator */}
+          {interimSpeech && (
+            <div className="mb-2 px-3.5 py-1.5 rounded-full bg-neutral-900/90 border border-emerald-500/40 text-emerald-200 text-xs flex items-center gap-2 shadow-xl backdrop-blur-xl max-w-full">
+              <span className="flex h-2 w-2 relative shrink-0">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400"></span>
+              </span>
+              <span className="truncate italic text-[11px] md:text-xs">"{interimSpeech}"</span>
+              <span className="text-[10px] text-emerald-400/70 ml-auto shrink-0 font-medium">auto-sending...</span>
+            </div>
+          )}
+
           <form
             onSubmit={handleFormSubmit}
-            className="flex items-center gap-2 px-3 py-2 rounded-full bg-neutral-900/80 backdrop-blur-xl border border-white/15 shadow-2xl shadow-black/60 transition-all focus-within:border-purple-500/60 focus-within:ring-1 focus-within:ring-purple-500/40"
+            onPaste={handlePaste}
+            className={`flex items-center gap-1.5 md:gap-2 px-3 py-2 rounded-full bg-neutral-900/85 backdrop-blur-xl border ${
+              isDraggingOver
+                ? 'border-purple-400 ring-2 ring-purple-400/50 scale-[1.02]'
+                : selectedImage
+                ? 'border-purple-500/60 ring-1 ring-purple-500/30'
+                : 'border-white/15'
+            } shadow-2xl shadow-black/60 transition-all focus-within:border-purple-500/60 focus-within:ring-1 focus-within:ring-purple-500/40`}
           >
+            {/* Photo Upload Button */}
+            <button
+              type="button"
+              id="photo-upload-button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isGenerating}
+              className={`p-2 rounded-full transition flex items-center justify-center shrink-0 ${
+                selectedImage
+                  ? 'bg-purple-600/90 text-white shadow-md shadow-purple-900/50 ring-1 ring-purple-300/60'
+                  : 'text-neutral-400 hover:text-purple-300 hover:bg-white/10'
+              }`}
+              title="Upload photo / image for Columbina to inspect"
+              aria-label="Upload photo"
+            >
+              <ImageIcon className="w-4 h-4" />
+            </button>
+
             {/* Voice Input Button */}
             <button
               type="button"
               id="voice-mic-toggle-button"
               onClick={toggleListening}
-              className={`p-2 rounded-full transition flex items-center justify-center relative ${
+              className={`p-2 rounded-full transition flex items-center justify-center relative shrink-0 ${
                 !isMicActive
                   ? 'text-neutral-400 hover:text-white hover:bg-white/10'
                   : isGenerating || isValidatingVoice
@@ -460,40 +724,41 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
             <input
               type="text"
               id="ethereal-chat-input"
-              value={interimSpeech || inputText}
+              value={inputText}
               onChange={(e) => {
-                if (interimSpeech) setInterimSpeech('');
                 setInputText(e.target.value);
               }}
               placeholder={
-                isValidatingVoice
+                selectedImage
+                  ? 'Ask Columbina about this photo... (or press send)'
+                  : isValidatingVoice
                   ? 'Understanding speech softly...'
                   : !isMicActive
                   ? isGenerating
                     ? 'Columbina is thinking softly...'
-                    : 'Speak or type a message to Columbina...'
+                    : 'Ask Columbina anything, or share a photo...'
                   : isGenerating
                   ? 'Columbina is thinking softly...'
                   : isSpeaking
-                  ? 'Columbina is speaking softly... (type or speak to interrupt)'
+                  ? 'Columbina is speaking softly... (speak to interrupt)'
                   : interimSpeech
-                  ? interimSpeech
-                  : 'Listening... speak naturally to Columbina (Mic is ON)'
+                  ? `Listening: "${interimSpeech}..."`
+                  : 'Listening... speak naturally to Columbina (Auto-sends)'
               }
               disabled={isGenerating || isValidatingVoice}
-              className="flex-1 bg-transparent border-none text-xs md:text-sm text-white placeholder-neutral-400 focus:outline-none px-1"
+              className="flex-1 min-w-0 bg-transparent border-none text-xs md:text-sm text-white placeholder-neutral-400 focus:outline-none px-1"
             />
 
             {/* Send Button */}
             <button
               type="submit"
-              disabled={(!inputText.trim() && !interimSpeech.trim()) || isGenerating}
-              className={`p-2 rounded-full transition ${
-                (inputText.trim() || interimSpeech.trim()) && !isGenerating
+              disabled={(!inputText.trim() && !selectedImage) || isGenerating}
+              className={`p-2 rounded-full transition shrink-0 ${
+                (inputText.trim() || selectedImage) && !isGenerating
                   ? 'bg-purple-600 hover:bg-purple-500 text-white shadow-md shadow-purple-900/40'
                   : 'text-neutral-600 cursor-not-allowed'
               }`}
-              title="Send"
+              title="Send message"
               aria-label="Send message"
             >
               <Send className="w-4 h-4" />
@@ -503,7 +768,7 @@ export const EtherealDialogueBar: React.FC<EtherealDialogueBarProps> = ({
             <button
               type="button"
               onClick={() => setIsBarHidden(true)}
-              className="p-1.5 text-neutral-500 hover:text-neutral-300 hover:bg-white/5 rounded-full transition"
+              className="p-1.5 text-neutral-500 hover:text-neutral-300 hover:bg-white/5 rounded-full transition shrink-0"
               title="Hide Bar"
               aria-label="Hide Bar"
             >

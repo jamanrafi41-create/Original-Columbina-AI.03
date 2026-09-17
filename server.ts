@@ -14,7 +14,7 @@ import { groqProvider } from "./server/providers/groq";
 dotenv.config();
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = 3000;
 
 app.use(express.json({ limit: "15mb" }));
 
@@ -144,17 +144,44 @@ app.post("/api/live/session", (_req, res) => {
   }
 });
 
-// Proxy for the VRM 3D model to guarantee bypass of CORS restrictions
-app.get("/api/model-proxy", async (req, res) => {
-  const targetUrl = (req.query.url as string) || "https://files.catbox.moe/r6x4ad.vrm";
-  
-  // Fast path: if requesting default model and cached locally, serve immediately
-  const localModelPath = path.join(process.cwd(), "public", "model.vrm");
-  if ((!req.query.url || req.query.url === "https://files.catbox.moe/r6x4ad.vrm") && fs.existsSync(localModelPath)) {
+// Helper to find local Columbina VRM model file safely
+function getLocalVRMPath(): string | null {
+  const candidates = [
+    path.join(process.cwd(), "public", "columbinamodel.vrm"),
+    path.join(process.cwd(), "dist", "columbinamodel.vrm"),
+    path.join(process.cwd(), "public", "model.vrm"),
+    path.join(process.cwd(), "dist", "model.vrm"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function serveLocalVRM(res: express.Response): void {
+  const localModelPath = getLocalVRMPath();
+  if (localModelPath) {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Content-Type", "model/gltf-binary");
     res.setHeader("Cache-Control", "public, max-age=86400");
-    return res.sendFile(localModelPath);
+    res.sendFile(localModelPath);
+    return;
+  }
+  res.status(404).json({ error: "Local VRM model file not found" });
+}
+
+// Proxy for the VRM 3D model with automatic local fallback & 429 prevention
+app.get("/api/model-proxy", async (req, res) => {
+  const targetUrl = (req.query.url as string) || "";
+  const isDefaultOrLocal =
+    !targetUrl ||
+    targetUrl === "https://files.catbox.moe/r6x4ad.vrm" ||
+    targetUrl.endsWith("/columbinamodel.vrm") ||
+    targetUrl.endsWith("/model.vrm");
+
+  // Fast path: if requesting default/local model, serve immediately without external network calls
+  if (isDefaultOrLocal) {
+    return serveLocalVRM(res);
   }
 
   try {
@@ -164,10 +191,12 @@ app.get("/api/model-proxy", async (req, res) => {
       },
     });
 
+    // If external host returns 429 Too Many Requests or fails, fallback to bundled local model
     if (!fetchResponse.ok) {
-      return res.status(fetchResponse.status).json({
-        error: `Failed to fetch VRM model: ${fetchResponse.statusText}`,
-      });
+      console.warn(
+        `External VRM fetch failed with status ${fetchResponse.status} (${fetchResponse.statusText}), falling back to local VRM model.`
+      );
+      return serveLocalVRM(res);
     }
 
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -176,10 +205,10 @@ app.get("/api/model-proxy", async (req, res) => {
 
     const arrayBuffer = await fetchResponse.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
-    res.send(buffer);
+    return res.send(buffer);
   } catch (error: any) {
-    console.error("Error proxying VRM model:", error);
-    res.status(500).json({ error: error.message || "Failed to proxy VRM file" });
+    console.error("Error proxying VRM model from external URL, falling back to local VRM:", error);
+    return serveLocalVRM(res);
   }
 });
 
@@ -325,21 +354,27 @@ app.post(["/api/chat", "/api/chat/stream"], async (req, res) => {
       res.flushHeaders?.();
 
       try {
-        const result = await orchestrator.executeChat({
-          messages,
-          aiBrain,
-          personality,
-          memory,
-          voiceAnalysis: voiceAnalysis || lastUserMsgObj?.voiceAnalysis,
-          currentLanguage: activeLanguage,
-        });
-
-        // Stream word chunks for natural smooth typewriter rendering
-        const words = result.cleanText.split(/(\s+)/);
-        for (let i = 0; i < words.length; i += 2) {
-          const chunk = (words[i] || "") + (words[i + 1] || "");
-          res.write(`data: ${JSON.stringify({ type: "chunk", chunk })}\n\n`);
-        }
+        const result = await orchestrator.executeChatStream(
+          {
+            messages,
+            aiBrain,
+            personality,
+            memory,
+            voiceAnalysis: voiceAnalysis || lastUserMsgObj?.voiceAnalysis,
+            currentLanguage: activeLanguage,
+          },
+          {
+            onMeta: (meta) => {
+              res.write(`data: ${JSON.stringify({ type: "meta", ...meta })}\n\n`);
+            },
+            onChunk: (chunk: string) => {
+              res.write(`data: ${JSON.stringify({ type: "chunk", chunk })}\n\n`);
+            },
+            onSentence: (sentence: string) => {
+              res.write(`data: ${JSON.stringify({ type: "sentence", sentence })}\n\n`);
+            },
+          }
+        );
 
         res.write(
           `data: ${JSON.stringify({
@@ -502,6 +537,55 @@ function normalizeVoiceTranscript(
 
   let text = trimmed;
 
+  // STT Deduplication: eliminate repeated sentences, multi-word phrases, and duplicate adjacent words
+  // e.g. "hello how are you hello how are you" -> "hello how are you"
+  const rawWords = text.split(/\s+/);
+  if (rawWords.length >= 4 && rawWords.length % 2 === 0) {
+    const half = rawWords.length / 2;
+    const h1 = rawWords.slice(0, half).join(' ').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    const h2 = rawWords.slice(half).join(' ').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    if (h1 && h1 === h2) {
+      text = rawWords.slice(0, half).join(' ');
+    }
+  }
+
+  // Multi-word phrase deduplication (from 8 down to 2 words)
+  for (let phraseLen = 8; phraseLen >= 2; phraseLen--) {
+    let wordsArr = text.split(/\s+/);
+    let changed = false;
+    for (let i = 0; i <= wordsArr.length - phraseLen * 2; i++) {
+      const p1 = wordsArr.slice(i, i + phraseLen).join(' ').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+      const p2 = wordsArr.slice(i + phraseLen, i + phraseLen * 2).join(' ').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+      if (p1 && p1.length >= 4 && p1 === p2) {
+        wordsArr.splice(i + phraseLen, phraseLen);
+        text = wordsArr.join(' ');
+        changed = true;
+        break;
+      }
+    }
+    if (changed) {
+      phraseLen = 9;
+    }
+  }
+
+  // Adjacent duplicate words (excluding legitimate repeats like 'that that', 'had had')
+  const legitimateRepeats = new Set(['that', 'had']);
+  const splitted = text.split(/\s+/);
+  const deduped: string[] = [];
+  for (let i = 0; i < splitted.length; i++) {
+    const w = splitted[i];
+    const prev = deduped[deduped.length - 1];
+    if (prev) {
+      const wNorm = w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+      const prevNorm = prev.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+      if (wNorm && wNorm === prevNorm && !legitimateRepeats.has(wNorm)) {
+        continue;
+      }
+    }
+    deduped.push(w);
+  }
+  text = deduped.join(' ');
+
   // Custom Proper-Name Vocabulary Normalization:
   // Columbina (Colombina, Columbena, Columbine, Column bina, Callum bina)
   text = text.replace(
@@ -629,12 +713,14 @@ CRITICAL RULES:
 1. Determine what STT probably heard vs what the user most likely actually said.
 2. Context-Aware: Disambiguate homophones (e.g., 'witch' vs 'which', 'too' vs 'to', 'due' vs 'do', 'there' vs 'their') using previous context.
 3. Proper-Name Normalization: When addressing or referring to the companion, correct variations to "Columbina" or correct world names.
-4. DO NOT OVER-CORRECT:
+4. STT Deduplication: If the transcript contains repeated sentences, phrases, or stuttered words caused by speech recognition artifacts (such as "hello how are you hello how are you"), eliminate the duplicate and output only the single intended sentence.
+5. Punctuation Restoration: Restore appropriate punctuation (e.g. question mark for questions, period, comma) where missing.
+6. DO NOT OVER-CORRECT:
    - Do NOT rewrite or rephrase the user's sentence.
    - Do NOT invent words or add meaning the user did not say.
    - Preserve unusual phrasing, brief questions, or colloquial grammar if understandable.
    - Only correct speech recognition errors.
-5. Internal Confidence System:
+7. Internal Confidence System:
    - 0.90 to 1.00: High clarity, unambiguous, or standard well-formed message.
    - 0.70 to 0.89: Minor phonological/homophone error corrected using context.
    - 0.50 to 0.69: Heavily dependent on context or partial phonetic similarity.
@@ -848,9 +934,33 @@ app.post("/api/tts/fish", async (req, res) => {
   }
 });
 
-// Shortcut to model proxy for default local VRM paths
+// Direct zero-redirect serving for default local VRM paths
 app.get(["/columbinamodel.vrm", "/model.vrm"], (_req, res) => {
-  res.redirect("/api/model-proxy");
+  return serveLocalVRM(res);
+});
+
+// Explicit PWA Web Manifest routing for reliable Android detection
+app.get(["/manifest.webmanifest", "/manifest.json"], (_req, res) => {
+  const manifestPath = path.join(process.cwd(), "public", "manifest.webmanifest");
+  if (fs.existsSync(manifestPath)) {
+    res.setHeader("Content-Type", "application/manifest+json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache");
+    return res.sendFile(manifestPath);
+  }
+  return res.status(404).send("Manifest not found");
+});
+
+// Explicit Service Worker routing to avoid SPA HTML fallback
+app.get("/sw.js", (_req, res) => {
+  const swPublicPath = path.join(process.cwd(), "public", "sw.js");
+  const swDistPath = path.join(process.cwd(), "dist", "sw.js");
+  const targetPath = fs.existsSync(swPublicPath) ? swPublicPath : swDistPath;
+  if (fs.existsSync(targetPath)) {
+    res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    return res.sendFile(targetPath);
+  }
+  return res.status(404).send("Service worker not found");
 });
 
 // Mount Vite middleware in development or serve static files in production
@@ -858,7 +968,10 @@ async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);

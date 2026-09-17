@@ -1,5 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { ChatMessage, Emotion } from '../types';
+import { ChatMessage, Emotion, ParalinguisticAnalysis } from '../types';
+import {
+  mergeSpeechTranscripts,
+  cleanFinalTranscript,
+  getSilenceTimeoutForUtterance,
+  isNoiseTranscript,
+  normalizeForComparison,
+} from '../utils/speechDeduplicator';
 import {
   Send,
   Mic,
@@ -13,6 +20,8 @@ import {
   Smile,
   Zap,
   Loader2,
+  Image as ImageIcon,
+  X,
 } from 'lucide-react';
 
 interface ChatOverlayProps {
@@ -21,7 +30,12 @@ interface ChatOverlayProps {
   isSpeaking: boolean;
   currentEmotion: Emotion;
   autoSpeak: boolean;
-  onSendMessage: (text: string) => void;
+  onSendMessage: (
+    text: string,
+    voiceAnalysis?: ParalinguisticAnalysis,
+    image?: string,
+    imageName?: string
+  ) => void;
   onReplayAudio: (message: ChatMessage) => void;
   onToggleAutoSpeak: () => void;
   onClearChat: () => void;
@@ -41,10 +55,32 @@ export const ChatOverlay: React.FC<ChatOverlayProps> = ({
   onTriggerEmotion,
 }) => {
   const [inputText, setInputText] = useState<string>('');
+  const [selectedImage, setSelectedImage] = useState<{
+    base64: string;
+    name: string;
+    size: string;
+  } | null>(null);
   const [isListening, setIsListening] = useState<boolean>(false);
   const [isMinimized, setIsMinimized] = useState<boolean>(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const processImageFile = (file: File) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const result = e.target?.result as string;
+      if (result) {
+        setSelectedImage({
+          base64: result,
+          name: file.name,
+          size: (file.size / 1024).toFixed(0) + ' KB',
+        });
+      }
+    };
+    reader.readAsDataURL(file);
+  };
 
   // Auto-scroll to bottom on new messages
   useEffect(() => {
@@ -61,7 +97,13 @@ export const ChatOverlay: React.FC<ChatOverlayProps> = ({
   const isGeneratingRef = useRef(false);
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const restartTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const accumulatedRef = useRef('');
+  const turnHistoryRef = useRef('');
+  const sessionFinalRef = useRef('');
+  const sessionInterimRef = useRef('');
+  const pendingUtteranceRef = useRef('');
+  const isSubmittingRef = useRef(false);
+  const lastProcessedTextRef = useRef('');
+  const lastProcessedTimeRef = useRef(0);
 
   useEffect(() => {
     isListeningRef.current = isListening;
@@ -92,6 +134,58 @@ export const ChatOverlay: React.FC<ChatOverlayProps> = ({
     } catch (e) {}
   };
 
+  const clearSpeechBuffers = () => {
+    turnHistoryRef.current = '';
+    sessionFinalRef.current = '';
+    sessionInterimRef.current = '';
+    pendingUtteranceRef.current = '';
+    setInterimSpeech('');
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+  };
+
+  const commitSpeech = (text: string) => {
+    if (isSubmittingRef.current) return;
+
+    const fullCombined = mergeSpeechTranscripts([
+      turnHistoryRef.current,
+      text,
+    ]).trim();
+
+    const clean = cleanFinalTranscript(fullCombined);
+    if (!clean || isNoiseTranscript(clean)) {
+      clearSpeechBuffers();
+      return;
+    }
+
+    if (isGeneratingRef.current || isSpeakingRef.current) return;
+
+    const now = Date.now();
+    if (
+      normalizeForComparison(clean) === normalizeForComparison(lastProcessedTextRef.current) &&
+      now - lastProcessedTimeRef.current < 2500
+    ) {
+      clearSpeechBuffers();
+      return;
+    }
+
+    isSubmittingRef.current = true;
+    lastProcessedTextRef.current = clean;
+    lastProcessedTimeRef.current = now;
+    clearSpeechBuffers();
+    safeStop();
+
+    try {
+      onSendMessage(clean);
+    } finally {
+      setTimeout(() => {
+        isSubmittingRef.current = false;
+      }, 500);
+    }
+  };
+
   // Auto-resume when Columbina finishes speaking
   useEffect(() => {
     if (isListening && !isSpeaking && !isGenerating) {
@@ -114,43 +208,47 @@ export const ChatOverlay: React.FC<ChatOverlayProps> = ({
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = 'en-US';
+      recognition.maxAlternatives = 1;
 
       recognition.onstart = () => {
         setMicError(null);
       };
 
       recognition.onresult = (event: any) => {
-        let currentFinal = '';
-        let currentInterim = '';
+        const finalParts: string[] = [];
+        const interimParts: string[] = [];
 
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
+        for (let i = 0; i < event.results.length; ++i) {
           const item = event.results[i];
-          const text = item[0]?.transcript || '';
+          const text = (item[0]?.transcript || '').trim();
+          if (!text) continue;
           if (item.isFinal) {
-            currentFinal += text + ' ';
+            finalParts.push(text);
           } else {
-            currentInterim += text;
+            interimParts.push(text);
           }
         }
 
-        if (currentFinal.trim()) {
-          accumulatedRef.current = (accumulatedRef.current + ' ' + currentFinal).trim();
-        }
+        sessionFinalRef.current = finalParts.join(' ').trim();
+        sessionInterimRef.current = interimParts.join(' ').trim();
 
-        const total = (accumulatedRef.current + ' ' + currentInterim).trim();
-        if (total) {
-          setInterimSpeech(total);
+        const combinedSpeech = mergeSpeechTranscripts([
+          turnHistoryRef.current,
+          sessionFinalRef.current,
+          sessionInterimRef.current,
+        ]).trim();
+
+        if (combinedSpeech) {
+          pendingUtteranceRef.current = combinedSpeech;
+          setInterimSpeech(combinedSpeech);
 
           if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          const timeoutMs = getSilenceTimeoutForUtterance(combinedSpeech);
           silenceTimerRef.current = setTimeout(() => {
-            if (isGeneratingRef.current || isSpeakingRef.current) return;
-            const toSend = total.trim();
-            accumulatedRef.current = '';
-            setInterimSpeech('');
-            setInputText('');
-            safeStop();
-            onSendMessage(toSend);
-          }, 950);
+            if (pendingUtteranceRef.current && !isSubmittingRef.current) {
+              commitSpeech(pendingUtteranceRef.current);
+            }
+          }, timeoutMs);
         }
       };
 
@@ -164,13 +262,22 @@ export const ChatOverlay: React.FC<ChatOverlayProps> = ({
       };
 
       recognition.onend = () => {
+        if (sessionFinalRef.current) {
+          turnHistoryRef.current = mergeSpeechTranscripts([
+            turnHistoryRef.current,
+            sessionFinalRef.current,
+          ]);
+          sessionFinalRef.current = '';
+          sessionInterimRef.current = '';
+        }
+
         if (isListeningRef.current && !isGeneratingRef.current && !isSpeakingRef.current) {
           if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
           restartTimerRef.current = setTimeout(() => {
             if (isListeningRef.current && !isGeneratingRef.current && !isSpeakingRef.current) {
               safeStart();
             }
-          }, 150);
+          }, 50);
         }
       };
 
@@ -201,17 +308,23 @@ export const ChatOverlay: React.FC<ChatOverlayProps> = ({
 
   const handleSend = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const trimmed = (interimSpeech || inputText).trim();
-    if (!trimmed || isGenerating) return;
+    const trimmed = inputText.trim();
+    if ((!trimmed && !selectedImage) || isGenerating) return;
 
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    accumulatedRef.current = '';
+    pendingUtteranceRef.current = '';
     setInterimSpeech('');
 
     safeStop();
 
-    onSendMessage(trimmed);
+    onSendMessage(
+      trimmed,
+      undefined,
+      selectedImage?.base64,
+      selectedImage?.name
+    );
     setInputText('');
+    setSelectedImage(null);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -368,6 +481,17 @@ export const ChatOverlay: React.FC<ChatOverlayProps> = ({
                     </div>
                   )}
 
+                  {/* Attached photo thumbnail */}
+                  {msg.image && (
+                    <div className="mb-2 overflow-hidden rounded-xl border border-white/20 shadow-md">
+                      <img
+                        src={msg.image}
+                        alt={msg.imageName || 'Uploaded photo'}
+                        className="max-h-48 max-w-full rounded-lg object-contain bg-black/40"
+                      />
+                    </div>
+                  )}
+
                   <p className="whitespace-pre-wrap leading-relaxed select-text">
                     {msg.cleanText || msg.content}
                   </p>
@@ -417,16 +541,77 @@ export const ChatOverlay: React.FC<ChatOverlayProps> = ({
             </div>
           )}
 
+          {/* Attached Photo Preview */}
+          {selectedImage && (
+            <div className="px-3 pt-2 pb-1 border-t border-white/10 bg-neutral-950/70 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 overflow-hidden">
+                <img
+                  src={selectedImage.base64}
+                  alt={selectedImage.name}
+                  className="w-8 h-8 rounded-lg object-cover border border-purple-400/40"
+                />
+                <div className="flex flex-col truncate">
+                  <span className="text-xs font-medium text-purple-200 truncate max-w-[200px]">
+                    {selectedImage.name}
+                  </span>
+                  <span className="text-[10px] text-neutral-400">Photo attached</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedImage(null)}
+                className="p-1 text-neutral-400 hover:text-rose-300 rounded-full"
+                title="Remove photo"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
           {/* Input Form Area */}
           <div className="p-3 border-t border-white/10 bg-neutral-950/50">
+            <input
+              type="file"
+              ref={fileInputRef}
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) processImageFile(file);
+                if (e.target) e.target.value = '';
+              }}
+            />
+
             <form onSubmit={handleSend} className="relative flex items-end gap-2">
+              {/* Photo upload button */}
+              <button
+                type="button"
+                id="chat-overlay-photo-button"
+                onClick={() => fileInputRef.current?.click()}
+                title="Upload a photo for Columbina"
+                aria-label="Upload photo"
+                className={`p-2.5 rounded-xl border transition flex items-center justify-center ${
+                  selectedImage
+                    ? 'bg-purple-600 border-purple-500 text-white'
+                    : 'bg-neutral-800 border-white/10 text-neutral-300 hover:text-white hover:bg-neutral-700'
+                }`}
+              >
+                <ImageIcon className="w-4 h-4" />
+              </button>
+
               <div className="relative flex-1 rounded-xl bg-neutral-900 border border-white/15 focus-within:border-purple-500 transition">
                 <textarea
                   id="chat-input-textarea"
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder={isListening ? 'Listening to your voice...' : 'Type a message to your 3D assistant...'}
+                  placeholder={
+                    selectedImage
+                      ? 'Ask about this photo...'
+                      : isListening
+                      ? 'Listening to your voice...'
+                      : 'Type a message to Columbina...'
+                  }
                   rows={1}
                   className="w-full bg-transparent px-3 py-2.5 text-sm text-white placeholder-neutral-500 focus:outline-none resize-none max-h-24 scrollbar-none"
                 />
@@ -459,7 +644,7 @@ export const ChatOverlay: React.FC<ChatOverlayProps> = ({
               <button
                 type="submit"
                 id="send-message-button"
-                disabled={!inputText.trim() || isGenerating}
+                disabled={(!inputText.trim() && !selectedImage) || isGenerating}
                 title="Send Message"
                 aria-label="Send Message"
                 className="p-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-40 disabled:hover:bg-purple-600 text-white transition flex items-center justify-center shadow-md shadow-purple-900/30"
